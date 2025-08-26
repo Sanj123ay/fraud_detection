@@ -1,34 +1,101 @@
-from pyspark.sql import SparkSession
-from pyspark.ml.feature import VectorAssembler
-from pyspark.ml.classification import RandomForestClassifier
-from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.ml.feature.{StringIndexer, VectorAssembler, StandardScaler}
+import org.apache.spark.ml.classification.RandomForestClassifier
+import org.apache.spark.ml.{Pipeline, PipelineModel}
+import org.apache.spark.ml.evaluation.BinaryClassificationEvaluator
+import org.apache.spark.ml.tuning.{ParamGridBuilder, CrossValidator}
 
-def create_spark_session(app_name="AML Detection"):
-    spark = SparkSession.builder \
-        .appName(app_name) \
-        .getOrCreate()
-    return spark
+object AntiMoneyLaunderingModel {
+  def main(args: Array[String]): Unit = {
+    val spark = SparkSession.builder()
+      .appName("AntiMoneyLaunderingModel")
+      .master("local[*]") // Use local mode for testing
+      .getOrCreate()
 
-def train_model(bucket_path):
-    spark = create_spark_session()
-    df = spark.read.csv(bucket_path, header=True, inferSchema=True)
+    // -------------------------------
+    // STEP 1: Load Dataset
+    // -------------------------------
+    val df = spark.read
+      .option("header", "true")
+      .option("inferSchema", "true")
+      .csv("C:\\Users\\sgirishc\\Desktop\\fraud_detection\\project\\data\\big_dataset.csv")
 
-    # Example preprocessing: filter and cast
-    df = df.filter("amount IS NOT NULL AND amount > 0")
-    df = df.withColumnRenamed("is_fraud", "label")  # assuming 'is_fraud' is the target column
+    println(s"✅ Loaded dataset with ${df.count()} rows and ${df.columns.length} columns")
 
-    feature_cols = [col for col in df.columns if col not in ('label', 'id')]
-    assembler = VectorAssembler(inputCols=feature_cols, outputCol="features")
-    data = assembler.transform(df).select("features", "label")
+    // -------------------------------
+    // STEP 2: Feature Engineering
+    // -------------------------------
+    val featureCols = df.columns.filter(_ != "Is_laundering")
 
-    train, test = data.randomSplit([0.8, 0.2], seed=42)
-    model = RandomForestClassifier(labelCol="label", featuresCol="features").fit(train)
+    val assembler = new VectorAssembler()
+      .setInputCols(featureCols)
+      .setOutputCol("features_unscaled")
 
-    predictions = model.transform(test)
-    evaluator = MulticlassClassificationEvaluator(labelCol="label", predictionCol="prediction", metricName="accuracy")
-    accuracy = evaluator.evaluate(predictions)
-    print(f"Model Accuracy: {accuracy}")
+    val scaler = new StandardScaler()
+      .setInputCol("features_unscaled")
+      .setOutputCol("features")
 
-if __name__ == "__main__":
-    bucket_path = "s3a://your-bucket-name/transactions.csv"  # Replace with your actual S3 path
-    train_model(bucket_path)
+    val labelIndexer = new StringIndexer()
+      .setInputCol("Is_laundering")
+      .setOutputCol("label")
+
+    // -------------------------------
+    // STEP 3: Define Model
+    // -------------------------------
+    val rf = new RandomForestClassifier()
+      .setFeaturesCol("features")
+      .setLabelCol("label")
+
+    // -------------------------------
+    // STEP 4: Build Pipeline
+    // -------------------------------
+    val pipeline = new Pipeline()
+      .setStages(Array(assembler, scaler, labelIndexer, rf))
+
+    // -------------------------------
+    // STEP 5: Train/Test Split
+    // -------------------------------
+    val Array(trainData, testData) = df.randomSplit(Array(0.8, 0.2), seed = 42)
+
+    // -------------------------------
+    // STEP 6: Hyperparameter Tuning
+    // -------------------------------
+    val paramGrid = new ParamGridBuilder()
+      .addGrid(rf.numTrees, Array(50, 100, 150))
+      .addGrid(rf.maxDepth, Array(5, 10, 15))
+      .addGrid(rf.featureSubsetStrategy, Array("auto", "sqrt", "log2"))
+      .build()
+
+    val evaluator = new BinaryClassificationEvaluator()
+      .setLabelCol("label")
+      .setMetricName("areaUnderROC")
+
+    val cv = new CrossValidator()
+      .setEstimator(pipeline)
+      .setEvaluator(evaluator)
+      .setEstimatorParamMaps(paramGrid)
+      .setNumFolds(3)
+
+    // -------------------------------
+    // STEP 7: Train Tuned Model
+    // -------------------------------
+    val cvModel = cv.fit(trainData)
+
+    // -------------------------------
+    // STEP 8: Evaluate Tuned Model
+    // -------------------------------
+    val predictions = cvModel.transform(testData)
+    val rocAuc = evaluator.evaluate(predictions)
+
+    println(f"✅ Tuned Random Forest model trained. ROC-AUC on test set: $rocAuc%.4f")
+
+    // -------------------------------
+    // STEP 9: Save Tuned Model
+    // -------------------------------
+    cvModel.write.overwrite().save("models/tuned_rf_model")
+    println("✅ Model saved to 'models/tuned_rf_model'")
+
+
+    spark.stop()
+  }
+}
