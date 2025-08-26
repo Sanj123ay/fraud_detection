@@ -1,0 +1,18 @@
+from pyspark.sql import SparkSession
+
+def create_spark_session(app_name="AML Detection"):
+    spark = SparkSession.builder \
+        .appName(app_name) \
+        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
+        .getOrCreate()
+    return spark
+
+def load_data_from_s3(bucket_path):
+    spark = create_spark_session()
+    df = spark.read.csv(bucket_path, header=True, inferSchema=True)
+    df.show(5)
+    return df
+
+if __name__ == "__main__":
+    bucket_path = "s3a://your-bucket-name/transactions.csv"  # Replace with your actual S3 path
+    load_data_from_s3(bucket_path)
