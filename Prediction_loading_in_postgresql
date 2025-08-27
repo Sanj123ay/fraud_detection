@@ -1,0 +1,55 @@
+import org.apache.spark.sql.{SparkSession, DataFrame}
+import org.apache.spark.ml.linalg.Vector
+import org.apache.spark.ml.tuning.CrossValidatorModel
+import org.apache.spark.sql.functions.udf
+
+object CSVVectorToPostgresWithModel {
+
+  def main(args: Array[String]): Unit = {
+    val spark = SparkSession.builder()
+      .appName("AML Prediction Pipeline")
+      .master("local[*]") // Adjust for your environment
+      .getOrCreate()
+
+    // Load CSV data
+    val df = spark.read
+      .option("header", "true")
+      .option("inferSchema", "true")
+      .csv("C:\\Users\\sgirishc\\Desktop\\fraud_detection\\project\\data\\big_dataset.csv") // <-- Update path
+
+    df.printSchema()
+
+    // Load the saved CrossValidatorModel
+    val modelPath = "C:\\Users\\sgirishc\\Desktop\\fraud_detection\\models\\tuned_rf_model" // <-- Update path
+    val model = CrossValidatorModel.load(modelPath)
+
+    // Apply model to get predictions
+    val predictions = model.transform(df)
+
+    // Detect vector columns using simpleString
+    val vectorColumns = predictions.schema.fields
+      .filter(_.dataType.simpleString == "vector")
+      .map(_.name)
+
+    println("Vector columns: " + vectorColumns.mkString(", "))
+
+    // UDF to convert Vector to comma-separated string
+    val vectorToString = udf((v: Vector) => v.toArray.mkString(","))
+
+    // Convert all vector columns to string
+    val convertedDF = vectorColumns.foldLeft(predictions) { (tempDF, colName) =>
+      tempDF.withColumn(colName + "_str", vectorToString(tempDF(colName))).drop(colName)
+    }
+
+    // Write to PostgreSQL
+    convertedDF.write
+      .format("jdbc")
+      .option("url", "jdbc:postgresql://localhost:5432/aml_db") // <-- Replace
+      .option("dbtable", "aml_predictions") // <-- Replace
+      .option("user", "postgres")         // <-- Replace
+      .option("password", "2203") // <-- Replace
+      .save()
+
+    spark.stop()
+  }
+}
