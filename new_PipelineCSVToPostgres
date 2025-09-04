@@ -1,0 +1,59 @@
+import org.apache.spark.sql.{SparkSession, DataFrame}
+import org.apache.spark.ml.PipelineModel
+import org.apache.spark.ml.linalg.Vector
+import org.apache.spark.sql.functions.{udf, current_timestamp}
+
+object PipelineCSVToPostgres {
+
+  def main(args: Array[String]): Unit = {
+    val spark = SparkSession.builder()
+      .appName("Pipeline Prediction Export")
+      .master("local[*]") // Use all cores locally
+      .getOrCreate()
+
+    // Load input CSV
+    val inputPath = "C:\\Users\\sgirishc\\Desktop\\fraud_detection\\path\\to\\output\\augmented_balanced_transactions" // <-- Update path
+    val df = spark.read
+      .option("header", "true")
+      .option("inferSchema", "true")
+      .csv(inputPath)
+
+    df.printSchema()
+
+    // Load trained PipelineModel
+    val modelPath = "C:\\Users\\sgirishc\\Desktop\\fraud_detection\\models\\new_final_pipeline_model_2" // <-- Update path
+    val model = PipelineModel.load(modelPath)
+
+    // Generate predictions
+    val predictions = model.transform(df)
+
+    // Identify vector columns
+    val vectorCols = predictions.schema.fields
+      .filter(_.dataType.simpleString == "vector")
+      .map(_.name)
+
+    println("Vector columns: " + vectorCols.mkString(", "))
+
+    // UDF to convert Vector to string
+    val vectorToStr = udf((v: Vector) => v.toArray.mkString(","))
+
+    // Convert vector columns to string format
+    val convertedDF = vectorCols.foldLeft(predictions) { (tempDF, colName) =>
+      tempDF.withColumn(colName + "_str", vectorToStr(tempDF(colName))).drop(colName)
+    }
+
+    // Add timestamp column
+    val finalDF = convertedDF.withColumn("prediction_time", current_timestamp())
+
+    // Write to PostgreSQL
+    finalDF.write
+      .format("jdbc")
+      .option("url", "jdbc:postgresql://localhost:5432/aml_db") // <-- Replace
+      .option("dbtable", "pipeline_results") // <-- Replace
+      .option("user", "postgres") // <-- Replace
+      .option("password", "2203") // <-- Replace
+      .save()
+
+    spark.stop()
+  }
+}
