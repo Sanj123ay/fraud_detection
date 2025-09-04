@@ -1,31 +1,86 @@
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.ml.feature.{StringIndexer, VectorAssembler, StandardScaler}
-import org.apache.spark.ml.classification.RandomForestClassifier
+import org.apache.spark.sql.functions._
 import org.apache.spark.ml.{Pipeline, PipelineModel}
+import org.apache.spark.ml.feature.{StringIndexer, VectorAssembler, StandardScaler, IndexToString}
+import org.apache.spark.ml.classification.RandomForestClassifier
 import org.apache.spark.ml.evaluation.BinaryClassificationEvaluator
-import org.apache.spark.ml.tuning.{ParamGridBuilder, CrossValidator}
+import org.apache.spark.ml.functions.vector_to_array
 
-object AntiMoneyLaunderingModel {
+object FraudDetectionApp {
   def main(args: Array[String]): Unit = {
     val spark = SparkSession.builder()
-      .appName("AntiMoneyLaunderingModel")
-      .master("local[*]") // Use local mode for testing
+      .appName("Fraud Detection with SparkML")
+      .master("local[*]")
       .getOrCreate()
 
-    // -------------------------------
-    // STEP 1: Load Dataset
-    // -------------------------------
-    val df = spark.read
+    // 1) Load data
+    val rawDF = spark.read
       .option("header", "true")
       .option("inferSchema", "true")
-      .csv("C:\\Users\\sgirishc\\Desktop\\fraud_detection\\project\\data\\big_dataset.csv")
+      .csv("C:\\Users\\sgirishc\\Desktop\\fraud_detection\\path\\to\\output\\augmented_balanced_transactions")
 
-    println(s"✅ Loaded dataset with ${df.count()} rows and ${df.columns.length} columns")
+    // 2) Strictly filter to binary labels only (0 and 1)
+    val df = rawDF
+      .filter(col("Is_laundering").isNotNull)
+      .filter(col("Is_laundering") === 0 || col("Is_laundering") === 1)
+      .withColumn("Is_laundering", col("Is_laundering").cast("double"))
+      .cache()
 
-    // -------------------------------
-    // STEP 2: Feature Engineering
-    // -------------------------------
-    val featureCols = df.columns.filter(_ != "Is_laundering")
+    // 3) Verify label distribution
+    println("✅ Label distribution after filtering:")
+    df.groupBy("Is_laundering").count().show()
+
+    // ----------------------------
+    // 4) StringIndexers for categoricals
+    // ----------------------------
+    val senderIndexer = new StringIndexer()
+      .setInputCol("Sender_bank_location")
+      .setOutputCol("sender_country_index")
+      .setHandleInvalid("keep")
+
+    val receiverIndexer = new StringIndexer()
+      .setInputCol("Receiver_bank_location")
+      .setOutputCol("receiver_country_index")
+      .setHandleInvalid("keep")
+
+    val paymentCurrencyIndexer = new StringIndexer()
+      .setInputCol("Payment_currency")
+      .setOutputCol("Payment_currency_index")
+      .setHandleInvalid("keep")
+
+    val receivedCurrencyIndexer = new StringIndexer()
+      .setInputCol("Received_currency")
+      .setOutputCol("Received_currency_index")
+      .setHandleInvalid("keep")
+
+    val paymentTypeIndexer = new StringIndexer()
+      .setInputCol("Payment_type")
+      .setOutputCol("Payment_type_index")
+      .setHandleInvalid("keep")
+
+    val labelIndexer = new StringIndexer()
+      .setInputCol("Is_laundering")
+      .setOutputCol("label")
+      .setHandleInvalid("skip")
+
+    // ----------------------------
+    // 4.1) Fit indexers FIRST to extract labels
+    // ----------------------------
+    val senderIndexerModel = senderIndexer.fit(df)
+    val receiverIndexerModel = receiverIndexer.fit(df)
+    val paymentCurrencyIndexerModel = paymentCurrencyIndexer.fit(df)
+    val receivedCurrencyIndexerModel = receivedCurrencyIndexer.fit(df)
+    val paymentTypeIndexerModel = paymentTypeIndexer.fit(df)
+
+    // 5) Feature assembler and scaler
+    val featureCols = Array(
+      "Amount",
+      "sender_country_index",
+      "receiver_country_index",
+      "Payment_currency_index",
+      "Received_currency_index",
+      "Payment_type_index"
+    )
 
     val assembler = new VectorAssembler()
       .setInputCols(featureCols)
@@ -35,66 +90,104 @@ object AntiMoneyLaunderingModel {
       .setInputCol("features_unscaled")
       .setOutputCol("features")
 
-    val labelIndexer = new StringIndexer()
-      .setInputCol("Is_laundering")
-      .setOutputCol("label")
-
-    // -------------------------------
-    // STEP 3: Define Model
-    // -------------------------------
+    // 6) Model
     val rf = new RandomForestClassifier()
       .setFeaturesCol("features")
       .setLabelCol("label")
+      .setNumTrees(100)
 
-    // -------------------------------
-    // STEP 4: Build Pipeline
-    // -------------------------------
-    val pipeline = new Pipeline()
-      .setStages(Array(assembler, scaler, labelIndexer, rf))
+    // ----------------------------
+    // 7) IndexToString converters (with correct labels)
+    // ----------------------------
+    val senderCountryConverter = new IndexToString()
+      .setInputCol("sender_country_index")
+      .setOutputCol("sender_country_original")
+      .setLabels(senderIndexerModel.labels)
 
-    // -------------------------------
-    // STEP 5: Train/Test Split
-    // -------------------------------
+    val receiverCountryConverter = new IndexToString()
+      .setInputCol("receiver_country_index")
+      .setOutputCol("receiver_country_original")
+      .setLabels(receiverIndexerModel.labels)
+
+    val paymentCurrencyConverter = new IndexToString()
+      .setInputCol("Payment_currency_index")
+      .setOutputCol("Payment_currency_original")
+      .setLabels(paymentCurrencyIndexerModel.labels)
+
+    val receivedCurrencyConverter = new IndexToString()
+      .setInputCol("Received_currency_index")
+      .setOutputCol("Received_currency_original")
+      .setLabels(receivedCurrencyIndexerModel.labels)
+
+    val paymentTypeConverter = new IndexToString()
+      .setInputCol("Payment_type_index")
+      .setOutputCol("payment_type_original")
+      .setLabels(paymentTypeIndexerModel.labels)
+
+    // ----------------------------
+    // 8) Pipeline
+    // ----------------------------
+    val pipeline = new Pipeline().setStages(Array(
+      // use the fitted indexer models instead of raw indexers
+      senderIndexerModel, receiverIndexerModel,
+      paymentCurrencyIndexerModel, receivedCurrencyIndexerModel, paymentTypeIndexerModel,
+      labelIndexer,
+      assembler, scaler,
+      rf,
+      paymentCurrencyConverter, receivedCurrencyConverter,
+      senderCountryConverter, receiverCountryConverter,
+      paymentTypeConverter
+    ))
+
+    // 9) Train/Test split
     val Array(trainData, testData) = df.randomSplit(Array(0.8, 0.2), seed = 42)
 
-    // -------------------------------
-    // STEP 6: Hyperparameter Tuning
-    // -------------------------------
-    val paramGrid = new ParamGridBuilder()
-      .addGrid(rf.numTrees, Array(50, 100, 150))
-      .addGrid(rf.maxDepth, Array(5, 10, 15))
-      .addGrid(rf.featureSubsetStrategy, Array("auto", "sqrt", "log2"))
-      .build()
+    // 10) Fit + Evaluate
+    val model = pipeline.fit(trainData)
+    val predictions = model.transform(testData)
 
     val evaluator = new BinaryClassificationEvaluator()
       .setLabelCol("label")
+      .setRawPredictionCol("rawPrediction")
       .setMetricName("areaUnderROC")
 
-    val cv = new CrossValidator()
-      .setEstimator(pipeline)
-      .setEvaluator(evaluator)
-      .setEstimatorParamMaps(paramGrid)
-      .setNumFolds(3)
-
-    // -------------------------------
-    // STEP 7: Train Tuned Model
-    // -------------------------------
-    val cvModel = cv.fit(trainData)
-
-    // -------------------------------
-    // STEP 8: Evaluate Tuned Model
-    // -------------------------------
-    val predictions = cvModel.transform(testData)
     val rocAuc = evaluator.evaluate(predictions)
+    println(f"✅ Model trained. ROC-AUC: $rocAuc%.4f")
 
-    println(f"✅ Tuned Random Forest model trained. ROC-AUC on test set: $rocAuc%.4f")
+    // 11) Convert probability vector to fraud probability
+    val withProb = predictions
+      .withColumn("probability_array", vector_to_array(col("probability")))
+      .withColumn("fraud_probability", col("probability_array").getItem(1))
+      .drop("probability_array")
 
-    // -------------------------------
-    // STEP 9: Save Tuned Model
-    // -------------------------------
-    cvModel.write.overwrite().save("models/tuned_rf_model")
-    println("✅ Model saved to 'models/tuned_rf_model'")
+    // 12) Select final output columns
+    val output = withProb.select(
+      col("Sender_account"),
+      col("Receiver_account"),
+      col("Amount"),
+      col("Payment_currency_original"),
+      col("Received_currency_original"),
+      col("sender_country_original"),
+      col("receiver_country_original"),
+      col("payment_type_original"),
+      col("prediction").cast("int"),
+      col("fraud_probability")
+    )
 
+    output.show(20, truncate = false)
+
+    // 13) Write to PostgreSQL
+    output.write
+      .format("jdbc")
+      .option("url", "jdbc:postgresql://localhost:5432/aml_db")
+      .option("dbtable", "fraud_predictions")
+      .option("user", "postgres")
+      .option("password", "2203")
+      .mode("append")
+      .save()
+
+    // 14) Save the full pipeline model
+    model.write.overwrite().save("models/new_final_pipeline_model_2")
 
     spark.stop()
   }
