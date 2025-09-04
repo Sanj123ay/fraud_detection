@@ -1,0 +1,76 @@
+// get the dataset from the kaggle from the below link and then run the augmentation code to get the proper code
+// https://www.kaggle.com/datasets/berkanoztas/synthetic-transaction-monitoring-dataset-aml
+
+// code is here 
+
+import org.apache.spark.sql.{SparkSession, Row}
+import org.apache.spark.sql.types._
+import java.sql.{Date, Timestamp}
+import java.time.{LocalDate, LocalTime}
+import scala.util.Random
+
+object FraudAugmentation {
+  def main(args: Array[String]): Unit = {
+    val spark = SparkSession.builder()
+      .appName("FraudAugmentation")
+      .master("local[*]") // Use "yarn" or "cluster" in production
+      .getOrCreate()
+
+    import spark.implicits._
+
+    // Load the dataset
+    val df = spark.read.option("header", "true").option("inferSchema", "true")
+      .csv("C:\\Users\\sgirishc\\Desktop\\fraud_detection\\project\\data\\SAML-D.csv")
+
+    // Separate fraud and non-fraud
+    val fraudDF = df.filter($"Is_laundering" === 1)
+    val nonFraudDF = df.filter($"Is_laundering" === 0)
+
+    // Define schema explicitly (adjust if needed)
+    val schema = StructType(Array(
+      StructField("Time", TimestampType, true),
+      StructField("Date", DateType, true),
+      StructField("Sender_account", LongType, true),
+      StructField("Receiver_account", LongType, true),
+      StructField("Amount", DoubleType, true),
+      StructField("Payment_currency", StringType, true),
+      StructField("Received_currency", StringType, true),
+      StructField("Sender_bank_location", StringType, true),
+      StructField("Receiver_bank_location", StringType, true),
+      StructField("Payment_type", StringType, true),
+      StructField("Is_laundering", IntegerType, true),
+      StructField("Laundering_type", StringType, true)
+    ))
+
+    // Function to generate synthetic fraud rows
+    def generateFraudRow(): Row = {
+      val time = LocalTime.of(Random.nextInt(24), Random.nextInt(60), Random.nextInt(60))
+      val date = LocalDate.now().minusDays(Random.nextInt(365))
+      Row(
+        Timestamp.valueOf(time.atDate(LocalDate.of(1970, 1, 1))), // Time
+        Date.valueOf(date),                                       // Date
+        1000000000L + Random.nextInt(899999999),
+        1000000000L + Random.nextInt(899999999),
+        BigDecimal(50000 + Random.nextDouble() * 450000).setScale(2, BigDecimal.RoundingMode.HALF_UP).toDouble,
+        "Euro", "Dirham", "UAE", "Nigeria", "ACH", 1, "Smurfing"
+      )
+    }
+
+    // Generate synthetic fraud rows
+    val numToGenerate = (nonFraudDF.count() - fraudDF.count()).toInt
+    val syntheticRows = spark.sparkContext.parallelize(Seq.fill(numToGenerate)(generateFraudRow()))
+
+    val syntheticFraudDF = spark.createDataFrame(syntheticRows, schema)
+
+    // Combine original and synthetic data
+    val augmentedDF = df.unionByName(syntheticFraudDF)
+
+    // Save the augmented dataset
+    augmentedDF.write
+      .option("header", "true")
+      .mode("overwrite")
+      .csv("path/to/output/augmented_balanced_transactions")
+
+    println("✅ Augmented dataset with synthetic fraud saved successfully.")
+  }
+}
